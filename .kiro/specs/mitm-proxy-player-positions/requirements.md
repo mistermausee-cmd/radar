@@ -4,14 +4,15 @@
 
 This feature adds real-time player position tracking to OpenRadar by implementing a Photon MITM (Man-In-The-Middle) proxy. Currently, OpenRadar operates as a passive capture tool that can detect player spawns and identities but cannot display live player positions because they are encrypted with a two-layer encryption scheme: Photon AES-256-CBC at the transport layer and Albion XOR encryption at the application layer.
 
-The MITM proxy will intercept the Diffie-Hellman key exchange between the Albion Online client and server, derive the session key, decrypt Photon events, extract the XorCode from Event 593 (KeySync), and decrypt player positions from Event 3 (Move) and Event 29 (NewCharacter).
+The MITM proxy will intercept the Diffie-Hellman key exchange between the Albion Online client and server, derive the session key, decrypt Photon events, extract the XorCode from the KeySync event, and decrypt player positions from Event 3 (Move) and Event 29 (NewCharacter) (subject to change across Albion patches; resolve symbolically).
 
 ## Glossary
 
 - **MITM_Proxy**: The Man-In-The-Middle proxy component that intercepts and decrypts Photon traffic between the Albion client and server
 - **Photon**: The UDP-based protocol used by Albion Online for game communication on port 5056
 - **Session_Key**: The AES-256 encryption key derived from the Diffie-Hellman shared secret using SHA256
-- **XorCode**: An 8-byte value transmitted in Event 593 (KeySync) used to decrypt player positions
+- **XorCode**: An 8-byte value transmitted in the KeySync event, used to decrypt player positions. Note: Albion shifts Photon event code numbers across patches, so the implementation MUST resolve event codes symbolically (via the generated eventcodes / EventCodes.js) rather than relying on a fixed number.
+- **KeySync**: The Photon event that carries the 8-byte XorCode (currently event code 600, subject to change across Albion patches). The implementation MUST resolve the KeySync code symbolically via the generated eventcodes / EventCodes.js rather than hardcoding a number.
 - **DH_Exchange**: Diffie-Hellman key exchange using Oakley 768-bit MODP group with generator 22
 - **AES_Decryptor**: Component responsible for AES-256-CBC decryption of Photon events
 - **Position_Decryptor**: Component responsible for XOR decryption of player coordinates using XorCode
@@ -58,16 +59,16 @@ The MITM proxy will intercept the Diffie-Hellman key exchange between the Albion
 4. IF AES decryption fails due to corrupted packet data, THEN THE MITM_Proxy SHALL skip the event and continue processing
 5. THE AES_Decryptor SHALL process events at a minimum rate of 100 events per second
 
-### Requirement 4: XorCode Extraction from Event 593
+### Requirement 4: XorCode Extraction from the KeySync Event
 
-**User Story:** As a developer, I want the MITM proxy to extract the XorCode from Event 593, so that I can decrypt player positions.
+**User Story:** As a developer, I want the MITM proxy to extract the XorCode from the KeySync event, so that I can decrypt player positions.
 
 #### Acceptance Criteria
 
-1. WHEN the MITM_Proxy detects Event 593 (KeySync), THE MITM_Proxy SHALL extract the 8-byte XorCode from the event parameters
+1. WHEN the MITM_Proxy detects the KeySync event, THE MITM_Proxy SHALL extract the 8-byte XorCode from the event parameters
 2. WHEN the XorCode is extracted, THE MITM_Proxy SHALL store the XorCode for the current game session
-3. WHEN the MITM_Proxy receives a new Event 593, THE MITM_Proxy SHALL update the stored XorCode with the new value
-4. IF Event 593 parameters do not contain a valid 8-byte XorCode, THEN THE MITM_Proxy SHALL log a warning and retain the previous XorCode
+3. WHEN the MITM_Proxy receives a new KeySync event, THE MITM_Proxy SHALL update the stored XorCode with the new value
+4. IF the KeySync event parameters do not contain a valid 8-byte XorCode, THEN THE MITM_Proxy SHALL log a warning and retain the previous XorCode
 5. THE MITM_Proxy SHALL make the XorCode available to the Position_Decryptor within 1ms of extraction
 
 ### Requirement 5: Player Position Decryption

@@ -2,9 +2,11 @@
 
 ## Overview
 
-OpenRadar currently operates as a passive network capture tool that cannot display live player positions because they are encrypted with a double layer: Photon AES-256-CBC encryption on all UDP 5056 traffic, and an additional Albion XOR encryption on position coordinates. The XorCode needed for position decryption is transmitted via Event 600 (KeySync), which is itself AES-encrypted.
+OpenRadar currently operates as a passive network capture tool that cannot display live player positions because they are encrypted with a double layer: Photon Protocol18 AES-256-CBC encryption on all UDP 5056 traffic, and an additional Albion XOR encryption on position coordinates. The XorCode needed for position decryption is transmitted via the KeySync event (currently event code 600; Albion shifts event codes across patches — always resolve via the generated `eventcodes` package, never hardcode), which is itself AES-encrypted. This two-layer encryption model is confirmed by the project's own analysis in `docs/technical/PLAYER_POSITIONS_MITM.md`.
 
-This design introduces a Photon Man-in-the-Middle (MITM) proxy that intercepts the Diffie-Hellman key exchange between the Albion client and server, derives the AES session key, decrypts Event 600 to extract the XorCode, and decrypts player positions in Event 3 (Move) and Event 29 (NewCharacter). The proxy integrates with the existing OpenRadar architecture while maintaining backward compatibility with passive capture mode.
+This design introduces a Photon Protocol18 Man-in-the-Middle (MITM) proxy that intercepts the Diffie-Hellman key exchange between the Albion client and server, derives the AES session key, decrypts the KeySync event to extract the XorCode, and decrypts player positions in Move (dispatch byte 3) and NewCharacter (real event code 29) events. The proxy integrates with the existing OpenRadar architecture while maintaining backward compatibility with passive capture mode.
+
+Under Protocol18 the wire carries only two dispatch bytes — `3` (Move, the hot path) and `1` (generic) — while the authoritative Albion event code is carried in `params[252]` as an int16 for events (and `params[253]` for operations). The frontend router (`web/scripts/core/EventRouter.js`) dispatches on `params[252]`. Consequently, events such as KeySync and NewCharacter cannot be identified from the wire dispatch byte alone; the proxy must read the real code from `params[252]`.
 
 ## Architecture
 
@@ -95,7 +97,7 @@ sequenceDiagram
     P->>S: Forward decrypted traffic
 ```
 
-### Event 600 KeySync Processing
+### KeySync Event Processing
 
 ```mermaid
 sequenceDiagram
@@ -105,23 +107,26 @@ sequenceDiagram
     participant W as WebSocket
     
     Note over S,W: KeySync Event Reception
-    S->>P: Event 600 (KeySync) - AES encrypted
+    S->>P: Generic event (dispatch byte 1) - AES encrypted
     P->>P: Decrypt AES layer
-    P->>P: Parse Event 600 parameters
+    P->>P: Read real code from params[252] (int16)
+    P->>P: real code == eventcodes.KeySync (currently 600)?
+    P->>P: Parse KeySync parameters
     
     Note over P: Extract XorCode
     P->>P: Parameters[0] = XorCode (8 bytes)
     P->>D: Store XorCode for session
     
     Note over S,W: Position Events
-    S->>P: Event 3 (Move) - AES + XOR encrypted
+    S->>P: Move (dispatch byte 3) - AES + XOR encrypted
     P->>P: Decrypt AES layer
-    P->>D: XOR decrypt positions
+    P->>D: XOR decrypt player positions
     D->>W: Broadcast decrypted Move event
     
-    S->>P: Event 29 (NewCharacter) - AES + XOR encrypted
-    P->>P: Decrypt AES layer
-    P->>D: XOR decrypt spawn position
+    S->>P: Generic event (dispatch byte 1) - AES encrypted
+    P->>P: Read real code from params[252] (int16)
+    P->>P: real code == eventcodes.NewCharacter (29)?
+    P->>D: XOR decrypt spawn position (OPEN ITEM - layout unverified)
     D->>W: Broadcast decrypted NewCharacter event
 ```
 
@@ -261,14 +266,15 @@ func (a *AESDecryptor) DecryptEvent(event *EventData) (*EventData, error)
 ```go
 // XORDecryptor handles XOR decryption of position coordinates
 type XORDecryptor struct {
-    xorCode   []byte  // 8-byte XorCode from Event 600
+    xorCode   []byte  // 8-byte XorCode from the KeySync event
     enabled   bool
 }
 
 func (x *XORDecryptor) SetXorCode(code []byte)
 func (x *XORDecryptor) DecryptFloat(encrypted []byte) float32
-func (x *XORDecryptor) DecryptPosition(event *EventData) (*EventData, error)
-func (x *XORDecryptor) ExtractXorCodeFromEvent600(event *EventData) ([]byte, error)
+func (x *XORDecryptor) DecryptPosition(event *EventData) (*EventData, error)      // Move (verified layout)
+func (x *XORDecryptor) DecryptSpawnPosition(event *EventData) (*EventData, error) // NewCharacter (OPEN ITEM - layout unverified)
+func (x *XORDecryptor) ExtractXorCodeFromKeySync(event *EventData) ([]byte, error)
 ```
 
 **XOR Algorithm**:
@@ -284,10 +290,11 @@ func (x *XORDecryptor) DecryptFloat(encrypted []byte) float32 {
 ```
 
 **Responsibilities**:
-- Store XorCode from Event 600
-- Decrypt position X coordinate (bytes 0-3)
-- Decrypt position Y coordinate (bytes 4-7)
+- Store XorCode from the KeySync event
+- Decrypt Move position X coordinate (bytes 0-3)
+- Decrypt Move position Y coordinate (bytes 4-7)
 - Handle relative vs absolute position conversion
+- (OPEN ITEM) Decrypt NewCharacter spawn position once the event-29 layout is verified from a live capture
 
 ### Component 5: SessionState
 
@@ -329,11 +336,13 @@ func (s *SessionState) Reset()
 
 ## Data Models
 
-### Model 1: Event600KeySync
+### Model 1: KeySyncEvent
 
 ```go
-// Event600KeySync represents the decrypted KeySync event
-type Event600KeySync struct {
+// KeySyncEvent represents the decrypted KeySync event (real code resolved from
+// params[252]; currently eventcodes.KeySync == 600, but Albion shifts codes
+// across patches).
+type KeySyncEvent struct {
     XorCode    []byte  `json:"xorCode"`    // 8 bytes, Parameters[0]
     Timestamp  int64   `json:"timestamp"`
     SequenceID int     `json:"sequenceId"`
@@ -426,17 +435,40 @@ func (p *MITMProxy) ProcessPacket(packet []byte) error {
         return nil
     }
     
-    // Step 5: Handle special events
-    switch event.Code {
-    case eventcodes.KeySync:
-        xorCode := p.xorDecryptor.ExtractXorCode(event)
-        p.session.SetXorCode(xorCode)
-        p.logger.Info("KeySync received", "xorCode", xorCode)
-        
-    case eventcodes.Move, eventcodes.NewCharacter:
+    // Step 5: Resolve the real Albion event code.
+    //
+    // Protocol18 reality: the wire dispatch byte (event.DispatchCode) is only
+    // ever 3 (Move, hot path) or 1 (generic). The authoritative Albion event
+    // code is carried in params[252] as int16 for events. Move is the only
+    // event identifiable by dispatch byte alone; every other event (KeySync,
+    // NewCharacter, ...) MUST be resolved from params[252]. See
+    // docs/technical/PROTOCOL18_PARAM_LAYOUTS.md and EventRouter.js, which
+    // routes on params[252].
+    if event.DispatchCode == 3 {
+        // Move hot path: matched directly on the wire dispatch byte.
         if p.session.GetXorCode() != nil {
             decrypted := p.xorDecryptor.DecryptPosition(event)
             p.broadcastEvent(decrypted)
+        }
+    } else {
+        // Generic dispatch byte (1): decode the real code from params[252].
+        // Never hardcode raw numbers; resolve via the generated eventcodes.
+        realCode, ok := readRealCode(event) // params[252] as int16
+        if ok {
+            switch realCode {
+            case eventcodes.KeySync: // currently 600; shifts across patches
+                xorCode := p.xorDecryptor.ExtractXorCodeFromKeySync(event)
+                p.session.SetXorCode(xorCode)
+                p.logger.Info("KeySync received", "xorCode", xorCode)
+                
+            case eventcodes.NewCharacter: // 29
+                if p.session.GetXorCode() != nil {
+                    // OPEN ITEM: the event-29 spawn-position layout differs
+                    // from Move and is unverified (see DecryptSpawnPosition).
+                    decrypted := p.xorDecryptor.DecryptSpawnPosition(event)
+                    p.broadcastEvent(decrypted)
+                }
+            }
         }
     }
     
@@ -507,8 +539,10 @@ func (d *DHKeyInterceptor) DeriveAESKey() ([]byte, error) {
 
 ### Position XOR Decryption Algorithm
 
+> **Verified (Move only):** the `params[1]` ByteArray carries posX at offset 9 and posY at offset 13, which `PostProcessEvent` injects into `params[4]` (X) and `params[5]` (Y). Only player Move blobs are XOR-encrypted at those offsets; mobs/resources share the same `params[1][0] == 3` shape but their positions are unencrypted. The `len(raw) < 17` guard correctly skips 22-byte mode-4 blobs, which never carry positions (see `docs/technical/PROTOCOL18_PARAM_LAYOUTS.md`). This pseudocode is verified accurate and unchanged.
+
 ```go
-// DecryptPosition extracts and decrypts position from Move/NewCharacter event
+// DecryptPosition extracts and decrypts position from a Move event
 // INPUT: event of type *EventData
 // OUTPUT: decrypted event with position parameters
 // PRECONDITION: xorCode is set (8 bytes)
@@ -568,17 +602,35 @@ func (x *XORDecryptor) DecryptPosition(event *EventData) *EventData {
 - XOR operation is deterministic
 - Same XorCode always produces same result
 
+### NewCharacter (Event 29) Spawn Position — OPEN ITEM
+
+> **Unverified layout.** The event-29 (NewCharacter) parameter layout differs
+> from Move and does **not** reuse the Move `params[1]` byte-array shape. Per
+> `docs/technical/PROTOCOL18_PARAM_LAYOUTS.md`, event 29 uses `params[1]` for the
+> character name (string), ByteArrays at `params[5..7,16,17]`, and float stats at
+> `params[19..37]`. Which parameter carries the XOR-encrypted spawn position, and
+> at what offset, has **not** been confirmed. The design MUST NOT assume the Move
+> offset 9/13 layout for event 29.
+>
+> `DecryptSpawnPosition(event)` is therefore an OPEN ITEM: the encrypted
+> spawn-position parameter and its byte offsets must be identified from a live
+> capture (e.g. via the analyzer/pcap workflow used to produce the Protocol18
+> layout snapshot) before implementation. Until then, no specific offset is
+> claimed for event 29, and the XOR key material (the KeySync XorCode) is the
+> only confirmed input.
+
 ### KeySync Event Processing Algorithm
 
 ```go
-// ExtractXorCode extracts the 8-byte XorCode from Event 600
-// INPUT: event of type *EventData
+// ExtractXorCode extracts the 8-byte XorCode from the KeySync event
+// INPUT: event of type *EventData, whose real code (from params[252]) is KeySync
 // OUTPUT: 8-byte XorCode
-// PRECONDITION: event.Code == 600 (KeySync)
+// PRECONDITION: real code decoded from params[252] == eventcodes.KeySync
 // POSTCONDITION: returned slice is exactly 8 bytes
-func (x *XORDecryptor) ExtractXorCodeFromEvent600(event *EventData) ([]byte, error) {
-    // ASSERT: event is Event 600
-    if event.Code != eventcodes.KeySync {
+func (x *XORDecryptor) ExtractXorCodeFromKeySync(event *EventData) ([]byte, error) {
+    // ASSERT: the real Albion code (params[252], not the wire dispatch byte) is
+    // KeySync. Resolve via the generated eventcodes; never hardcode raw numbers.
+    if realCode, ok := readRealCode(event); !ok || realCode != eventcodes.KeySync {
         return nil, errors.New("not KeySync event")
     }
     
@@ -669,15 +721,15 @@ func (x *XORDecryptor) DecryptPosition(event *EventData) *EventData
 **Loop Invariants:**
 - XOR decryption is deterministic for same XorCode
 
-### Function 4: ExtractXorCodeFromEvent600()
+### Function 4: ExtractXorCodeFromKeySync()
 
 ```go
-func (x *XORDecryptor) ExtractXorCodeFromEvent600(event *EventData) ([]byte, error)
+func (x *XORDecryptor) ExtractXorCodeFromKeySync(event *EventData) ([]byte, error)
 ```
 
 **Preconditions:**
 - `event` is not nil
-- `event.Code` equals `eventcodes.KeySync` (600)
+- The real Albion code decoded from `params[252]` (int16) equals `eventcodes.KeySync` (currently 600; resolve via the generated `eventcodes`, never hardcode — Albion shifts codes across patches)
 - Event is AES-decrypted
 
 **Postconditions:**
@@ -703,18 +755,28 @@ func main() {
     
     proxy := NewMITMProxy(config)
     
-    // Handle decrypted events
+    // Handle decrypted events.
+    // Protocol18: Move is matched on the wire dispatch byte (3); every other
+    // event is resolved from the real code in params[252]. Resolve via the
+    // generated eventcodes package - never hardcode raw numbers.
     proxy.OnPacket(func(event *photon.EventData) {
-        switch event.Code {
-        case eventcodes.Move:
+        if event.DispatchCode == 3 { // Move hot path
             x := event.Parameters[4].(float32)
             y := event.Parameters[5].(float32)
             fmt.Printf("Player moved to (%.2f, %.2f)\n", x, y)
-        case eventcodes.NewCharacter:
-            name := event.Parameters[1].(string)
-            x := event.Parameters[4].(float32)
-            y := event.Parameters[5].(float32)
-            fmt.Printf("Player %s spawned at (%.2f, %.2f)\n", name, x, y)
+            return
+        }
+        realCode, ok := readRealCode(event) // params[252] as int16
+        if !ok {
+            return
+        }
+        switch realCode {
+        case eventcodes.NewCharacter: // 29
+            name := event.Parameters[1].(string) // params[1] is the name string for event 29
+            // OPEN ITEM: the event-29 encrypted spawn-position parameter/offset
+            // is unverified (layout differs from Move); confirm from a live
+            // capture before extracting coordinates.
+            fmt.Printf("Player %s spawned (position pending event-29 layout verification)\n", name)
         }
     })
     
@@ -748,9 +810,9 @@ func (m *CaptureManager) SetMode(mode CaptureMode) error {
     return nil
 }
 
-// Example 3: Event 600 handling
-func (h *EventHandler) HandleEvent600(event *photon.EventData) {
-    xorCode, err := h.xorDecryptor.ExtractXorCodeFromEvent600(event)
+// Example 3: KeySync handling (real code resolved from params[252])
+func (h *EventHandler) HandleKeySync(event *photon.EventData) {
+    xorCode, err := h.xorDecryptor.ExtractXorCodeFromKeySync(event)
     if err != nil {
         h.logger.Warn("Failed to extract XorCode", "error", err)
         return
@@ -815,13 +877,13 @@ func (h *EventHandler) HandleEvent600(event *photon.EventData) {
 
 ### Property 9: XorCode Extraction
 
-*For any* valid Event 600 (KeySync) with XorCode in Parameters[0], the XOR decryptor SHALL extract exactly 8 bytes.
+*For any* valid KeySync event (currently code 600) with XorCode in Parameters[0], the XOR decryptor SHALL extract exactly 8 bytes.
 
 **Validates: Requirements 4.1**
 
 ### Property 10: XorCode Update
 
-*For any* sequence of Event 600 values arriving over time, the stored XorCode SHALL always equal the most recently received valid XorCode.
+*For any* sequence of KeySync event (currently code 600) values arriving over time, the stored XorCode SHALL always equal the most recently received valid XorCode.
 
 **Validates: Requirements 4.3**
 
@@ -839,7 +901,7 @@ func (h *EventHandler) HandleEvent600(event *photon.EventData) {
 
 ### Property 13: Spawn Position Decryption
 
-*For any* Event 29 (NewCharacter) with encrypted spawn position, the XOR decryptor SHALL decrypt the coordinates using the stored XorCode and inject them into Parameters[4] (X) and Parameters[5] (Y).
+*For any* Event 29 (NewCharacter) with an encrypted spawn position, once the event-29 parameter layout is verified from a live capture (see the NewCharacter Spawn Position OPEN ITEM), the XOR decryptor SHALL decrypt the spawn coordinates using the stored XorCode. The exact parameter/offset for event 29 is not yet confirmed and MUST NOT be assumed to match the Move layout.
 
 **Validates: Requirements 5.3**
 
@@ -1028,6 +1090,27 @@ The MITM proxy modifies the network path between client and server, which increa
 - Never log raw encryption keys
 - Secure XorCode storage (memory only, no disk)
 
+### Protocol Volatility & Scope
+
+- **Event codes shift across patches.** Albion renumbers event codes with game
+  patches (for example, a +2 shift was observed after the 2026-06-29 patch, and
+  older project docs referenced KeySync as 593 whereas 593 is now
+  `TerritoryAnnouncePlayerEjection` and KeySync is 600). The implementation MUST
+  resolve every event code through the generated `eventcodes` package (sourced
+  from `web/scripts/utils/EventCodes.js`) and MUST NOT hardcode raw numeric
+  codes anywhere in the decryption or routing path. The wire dispatch byte (only
+  `3` or `1` under Protocol18) is never sufficient on its own to identify KeySync
+  or NewCharacter — those are resolved from `params[252]`.
+- **This feature knowingly diverges from upstream scope.** The upstream
+  OpenRadar project deliberately scoped the MITM approach *out*, as documented in
+  `docs/technical/PLAYER_POSITIONS_MITM.md`. Its stated reasons are (a) modifying
+  the game's network path increases detection risk and changes the threat model,
+  and (b) a Photon MITM proxy is an estimated three to four weeks of focused work
+  (DH interception, AES decryption, XOR plumbing, replay safety) for a capability
+  the project's primarily PvE use cases do not need. This design consciously
+  diverges from that stance; the increased detection risk and effort are accepted
+  trade-offs the user must be made aware of.
+
 ## Dependencies
 
 ### Go Standard Library
@@ -1038,11 +1121,19 @@ The MITM proxy modifies the network path between client and server, which increa
 - `math/big`: Diffie-Hellman arithmetic
 - `net`: UDP networking
 
-### Existing OpenRadar Packages
+### Existing OpenRadar Packages (backend)
 
-- `internal/photon`: Event deserialization and parsing
-- `internal/capture`: Network capture interface
+- `internal/photon`: Protocol18 deserializer and event/parameter parsing
+- `internal/photon/events.go`: event 29 (NewCharacter) deserialization
+- `internal/photon/eventcodes` (generated from `web/scripts/utils/EventCodes.js`): authoritative Albion event codes; the proxy MUST resolve codes here rather than hardcoding raw numbers
+- `internal/capture`: network capture interface
 - `internal/server`: WebSocket broadcasting
+
+### Existing OpenRadar Frontend
+
+- `web/scripts/core/EventRouter.js`: routes events on the real code in `params[252]`
+- `web/scripts/handlers/PlayersHandler.js`: player detection, ignore list, alert gate, state
+- `web/scripts/drawings/PlayersDrawing.js`: radar rendering and color coding
 
 ### External Dependencies
 

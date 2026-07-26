@@ -24,7 +24,7 @@ This implementation plan breaks down the MITM proxy feature into four phases: Co
 - [ ] 1.2 Define data models and configuration structures
   - Create `MITMConfig` struct with validation methods
   - Create `SessionState` struct with thread-safe accessors
-  - Create `DecryptedPosition` and `Event600KeySync` models
+  - Create `DecryptedPosition` and `KeySyncEvent` models
   - Create `SessionStats` for metrics tracking
   - _Requirements: 11.1, 11.4_
   - **Priority: P0** | **Est: 1.5h**
@@ -157,11 +157,13 @@ This implementation plan breaks down the MITM proxy feature into four phases: Co
   - _Requirements: 4.1, 5.4, 5.5_
   - **Priority: P0** | **Est: 2h**
 
-- [ ] 6.2 Implement Event 600 (KeySync) processing
-  - Implement `ExtractXorCodeFromEvent600(event *EventData) ([]byte, error)`
+- [ ] 6.2 Implement KeySync event processing
+  - Implement `ExtractXorCodeFromKeySync(event *EventData) ([]byte, error)`
+  - Identify the KeySync event by resolving the real event code from `params[252]` (== `eventcodes.KeySync`), NOT the wire dispatch byte
+  - Resolve event codes symbolically via the generated `eventcodes` package — never hardcode (KeySync is currently 600 but shifts across patches)
   - Extract XorCode from Parameters[0] as ByteArray
   - Validate XorCode is exactly 8 bytes
-  - Update stored XorCode on new Event 600
+  - Update stored XorCode on each new KeySync event
   - _Requirements: 4.1, 4.2, 4.3_
   - **Priority: P0** | **Est: 2h**
 
@@ -170,10 +172,13 @@ This implementation plan breaks down the MITM proxy feature into four phases: Co
   - Decrypt X coordinate using XorCode bytes 0-3
   - Decrypt Y coordinate using XorCode bytes 4-7
   - Convert to float32 little-endian
+  - Note: the Move layout (params[1] offsets 9/13 → params[4]/[5]) is the VERIFIED layout
   - _Requirements: 5.1, 5.2, 5.4, 5.5_
   - **Priority: P0** | **Est: 2h**
 
 - [ ] 6.4 Implement position decryption for NewCharacter events
+  - **OPEN ITEM:** the event-29 spawn-position parameter/offset is UNVERIFIED — first identify the correct parameter/offset from a live capture as a prerequisite; do NOT assume the Move layout
+  - Implement `DecryptSpawnPosition(event *EventData) *EventData` once the layout is confirmed
   - Decrypt spawn position coordinates using XorCode
   - Inject decrypted positions into Parameters[4] and Parameters[5]
   - Validate decrypted coordinates are finite (not NaN/Inf)
@@ -181,7 +186,7 @@ This implementation plan breaks down the MITM proxy feature into four phases: Co
   - **Priority: P0** | **Est: 1.5h**
 
 - [ ]* 6.5 Write property tests for XOR decryption
-  - **Property 9: XorCode Extraction** - Verify 8-byte extraction from Event 600
+  - **Property 9: XorCode Extraction** - Verify 8-byte extraction from the KeySync event
   - **Property 10: XorCode Update** - Verify latest XorCode is stored
   - **Property 11: X Coordinate Decryption** - Verify XOR bytes 0-3
   - **Property 12: Y Coordinate Decryption** - Verify XOR bytes 4-7
@@ -209,6 +214,7 @@ This implementation plan breaks down the MITM proxy feature into four phases: Co
   - Route decrypted events to existing `internal/photon` deserializer
   - Preserve event structure for downstream processing
   - Handle Event 3 (Move) and Event 29 (NewCharacter) specifically
+  - Note: event identification for KeySync/NewCharacter must go through `params[252]` (per EventRouter.js / PROTOCOL18_PARAM_LAYOUTS.md), consistent with Protocol18
   - _Requirements: 6.1_
   - **Priority: P0** | **Est: 2h**
 
@@ -316,8 +322,8 @@ This implementation plan breaks down the MITM proxy feature into four phases: Co
 - [ ]* 11.1 Write edge case tests
   - Test corrupted packet data handling
   - Test missing XorCode scenario
-  - Test invalid XorCode length in Event 600
-  - Test malformed Event 600 parameters
+  - Test invalid XorCode length in the KeySync event
+  - Test malformed KeySync event parameters
   - _Requirements: 3.4, 4.4, 5.6, 8.6_
 
 - [ ]* 11.2 Write security verification tests
@@ -357,6 +363,7 @@ This implementation plan breaks down the MITM proxy feature into four phases: Co
 - Property tests validate universal correctness properties
 - Unit tests validate specific examples and edge cases
 - Priority levels: **P0** (critical), **P1** (important), **P2** (nice-to-have)
+- Event codes are resolved symbolically via the generated `eventcodes` package (KeySync currently 600); Albion shifts codes across patches — never hardcode.
 
 ## Task Dependency Graph
 
